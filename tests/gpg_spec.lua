@@ -32,7 +32,7 @@ describe("gpg.nvim", function()
       assert.is_nil(gpg.config.default_recipient)
       assert.is_false(gpg.config.use_armor)
       assert.is_false(gpg.config.allow_clipboard)
-      assert.is_true(gpg.config.show_progress)
+      assert.equals("spinner", gpg.config.show_progress)
     end)
   end)
 

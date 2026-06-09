@@ -36,10 +36,11 @@ require("gpg").setup({
   -- encrypted buffers so yanks do not leak decrypted text to the OS
   -- clipboard; it is restored when you leave the buffer.
   allow_clipboard = false,
-  -- Show transient encrypt/decrypt notifications, e.g.
-  -- "Encrypting with key <id>" (default: true). Routed through vim.notify,
-  -- so it renders via fidget/snacks/noice if you use one.
-  show_progress = true,
+  -- How to indicate encrypt/decrypt progress (default: "spinner"):
+  --   "spinner" - animated spinner via fidget.nvim
+  --   "toast"   - a transient vim.notify message
+  --   "none"    - nothing (errors are still reported)
+  show_progress = "spinner",
 })
 ```
 
@@ -58,6 +59,25 @@ require("gpg").setup({
   use_armor = true,
 })
 ```
+
+## Progress
+
+`show_progress` controls how encrypt/decrypt activity is shown:
+
+| Value       | Behavior                                                        |
+|-------------|-----------------------------------------------------------------|
+| `"spinner"` | Animated spinner via [fidget.nvim](https://github.com/j-hui/fidget.nvim) (default) |
+| `"toast"`   | A transient `vim.notify` message                                |
+| `"none"`    | Nothing (errors are still reported)                             |
+
+For `"spinner"`, install and enable **fidget.nvim**; gpg.nvim drives its
+progress API (no extra setup needed). If fidget isn't available, it falls
+back to a toast. Errors (failed decrypt/encrypt) are always reported via
+`vim.notify` regardless of this setting.
+
+Decryption runs asynchronously, so the spinner animates while the file
+decrypts on open. Encryption on save is synchronous (for data safety), so its
+indicator shows only briefly.
 
 ## Workflow
 

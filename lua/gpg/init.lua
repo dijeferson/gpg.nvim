@@ -9,7 +9,7 @@ local M = {}
 --- @field default_recipient string|nil GPG recipient (nil = default-recipient-self)
 --- @field use_armor boolean Use ASCII armor output
 --- @field allow_clipboard boolean Allow the system clipboard in encrypted buffers
---- @field show_progress boolean Show encrypt/decrypt progress notifications
+--- @field show_progress "spinner"|"toast"|"none" How to show encrypt/decrypt progress
 M.config = {
   gpg_binary_path = "gpg",
   file_patterns = "*.gpg",
@@ -20,10 +20,11 @@ M.config = {
   -- decrypted text does not leak it to the OS clipboard. Set true to keep
   -- your normal clipboard behaviour.
   allow_clipboard = false,
-  -- Show transient notifications while encrypting/decrypting (e.g.
-  -- "Encrypting with key <id>"). Routed through vim.notify, so it renders
-  -- via fidget/snacks/noice if you have one installed.
-  show_progress = true,
+  -- How to indicate encrypt/decrypt progress:
+  --   "spinner" - an animated spinner via fidget.nvim (default)
+  --   "toast"   - a transient vim.notify message
+  --   "none"    - no progress shown (errors are still reported)
+  show_progress = "spinner",
 }
 
 -- Track setup state to prevent double initialization
@@ -52,19 +53,46 @@ local function run_gpg(args, stdin)
   return vim.system(cmd, { stdin = stdin }):wait()
 end
 
---- Show a transient progress notification (if enabled). Routed through
---- vim.notify so it renders via fidget/snacks/noice when installed, and
---- forces a redraw so the message appears before the blocking GPG call.
---- @param msg string
-local function notify_progress(msg)
-  if not M.config.show_progress then
-    return
+--- Start a progress indicator according to config.show_progress:
+---   "spinner" -> an animated fidget.nvim progress handle
+---   "toast"   -> a one-shot vim.notify message
+---   "none"    -> nothing
+--- @param message string
+--- @return table|nil handle Opaque handle for finish_progress, or nil
+local function start_progress(message)
+  local mode = M.config.show_progress
+
+  if mode == "spinner" then
+    local ok, fidget_progress = pcall(require, "fidget.progress")
+    if ok then
+      return {
+        fidget = fidget_progress.handle.create({
+          title = "gpg.nvim",
+          message = message,
+          lsp_client = { name = "gpg.nvim" }, -- groups it like an LSP task
+          percentage = nil,                   -- indeterminate -> spinner
+        }),
+      }
+    end
+    -- fidget not installed: fall back to a toast so there is still feedback.
+    vim.notify(message, vim.log.levels.INFO, { title = "gpg.nvim" })
+    return nil
   end
-  vim.notify(msg, vim.log.levels.INFO, { title = "gpg.nvim" })
-  -- The encrypt/decrypt call blocks the UI; redraw now so the message is
-  -- visible while GPG runs. String form (not vim.cmd.redraw) so it survives
-  -- runners that replace vim.cmd with a plain function (e.g. neotest-plenary).
-  pcall(vim.cmd, "redraw")
+
+  if mode == "toast" then
+    vim.notify(message, vim.log.levels.INFO, { title = "gpg.nvim" })
+    return nil
+  end
+
+  return nil -- "none"
+end
+
+--- Finish a progress indicator started with start_progress.
+--- @param handle table|nil
+local function finish_progress(handle)
+  if handle and handle.fidget then
+    handle.fidget:finish()
+  end
 end
 
 --- Resolve a human-readable label for the encryption key, cached.
@@ -208,6 +236,77 @@ local function atomic_write(file_path, data)
   return true
 end
 
+--- Mark a buffer as failed-to-decrypt and lock it down so a later write
+--- cannot overwrite the original file with re-encrypted garbage.
+--- @param buf integer
+local function mark_decrypt_failed(buf)
+  vim.b[buf].gpg_decrypt_failed = true
+  vim.bo[buf].bin = false
+  vim.bo[buf].modifiable = false
+  vim.bo[buf].readonly = true
+  vim.bo[buf].modified = false
+end
+
+--- Place decrypted content into a buffer and restore a normal editing state.
+--- @param buf integer
+--- @param file_path string Original (encrypted) path, used for filetype
+--- @param content string Decrypted text
+local function populate_decrypted(buf, file_path, content)
+  vim.bo[buf].modifiable = true
+
+  local lines = { "" }
+  if content ~= "" then
+    lines = vim.split(content, "\n", { plain = true })
+    if lines[#lines] == "" then
+      table.remove(lines)
+    end
+  end
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+
+  vim.bo[buf].bin = false
+  vim.bo[buf].modified = false
+  vim.b[buf].gpg_decrypt_failed = false
+
+  -- Trigger filetype detection on the underlying filename (strip .gpg)
+  local inner_name = vim.fn.fnamemodify(file_path, ":t:r")
+  if inner_name ~= "" then
+    vim.filetype.match({ filename = inner_name, buf = buf })
+  end
+end
+
+--- Decrypt a file into a buffer asynchronously so opening never blocks the
+--- UI. The buffer is locked while GPG runs and populated on completion.
+--- @param buf integer Target buffer
+--- @param file_path string Path to the encrypted file
+local function decrypt_into_buffer_async(buf, file_path)
+  -- Prevent edits to the raw ciphertext while decryption is in flight.
+  vim.bo[buf].modifiable = false
+
+  local progress = start_progress("Decrypting " .. vim.fn.fnamemodify(file_path, ":t"))
+
+  local cmd = {
+    M.config.gpg_binary_path, "--quiet", "--yes", "--batch", "--decrypt", "--", file_path,
+  }
+
+  vim.system(cmd, {}, vim.schedule_wrap(function(result)
+    -- The buffer may have been closed before GPG finished.
+    if not vim.api.nvim_buf_is_valid(buf) then
+      finish_progress(progress)
+      return
+    end
+
+    if result.code ~= 0 then
+      mark_decrypt_failed(buf)
+      finish_progress(progress)
+      vim.notify("GPG decryption failed: " .. (result.stderr or ""), vim.log.levels.ERROR)
+      return
+    end
+
+    populate_decrypted(buf, file_path, result.stdout or "")
+    finish_progress(progress)
+  end))
+end
+
 --- Set up autocmds for transparent GPG file handling
 local function setup_autocmds()
   local group = vim.api.nvim_create_augroup("gpg_nvim", { clear = true })
@@ -260,47 +359,19 @@ local function setup_autocmds()
     group = group,
     desc = "gpg.nvim: decrypt file content",
     callback = function()
+      local buf = vim.api.nvim_get_current_buf()
       local file_path = vim.fn.expand("%:p")
 
-      -- Only announce when there is something to decrypt (skip new/empty files)
-      if vim.fn.filereadable(file_path) == 1 and vim.fn.getfsize(file_path) > 0 then
-        notify_progress("Decrypting " .. vim.fn.fnamemodify(file_path, ":t"))
-      end
-
-      local content = M.decrypt(file_path)
-
-      if content == nil then
-        -- Decryption failed: the buffer still holds raw ciphertext. Lock it
-        -- down so a later :w cannot overwrite the original file with garbage
-        -- (double-encryption => data loss).
-        vim.b.gpg_decrypt_failed = true
-        vim.opt_local.bin = false
-        vim.bo.modifiable = false
-        vim.bo.readonly = true
-        vim.bo.modified = false
+      -- New/empty file: nothing to decrypt, just leave it editable.
+      if vim.fn.filereadable(file_path) ~= 1 or vim.fn.getfsize(file_path) <= 0 then
+        vim.bo[buf].bin = false
+        vim.b[buf].gpg_decrypt_failed = false
         return
       end
 
-      -- Decryption succeeded: clear any prior failure flag
-      vim.b.gpg_decrypt_failed = false
-
-      if content ~= "" then
-        -- Split without adding a trailing empty line
-        local lines = vim.split(content, "\n", { plain = true })
-        if lines[#lines] == "" then
-          table.remove(lines)
-        end
-        vim.api.nvim_buf_set_lines(0, 0, -1, false, lines)
-      end
-
-      vim.opt_local.bin = false
-      vim.bo.modified = false
-
-      -- Trigger filetype detection on the underlying filename (strip .gpg)
-      local inner_name = vim.fn.expand("%:t:r")
-      if inner_name ~= "" then
-        vim.filetype.match({ filename = inner_name, buf = 0 })
-      end
+      -- Decrypt asynchronously so opening the file does not block the UI.
+      -- Progress (fidget spinner or notification) is handled inside.
+      decrypt_into_buffer_async(buf, file_path)
     end,
   })
 
@@ -342,16 +413,20 @@ local function setup_autocmds()
         target = vim.fn.expand("%:p")
       end
 
-      -- Build the key label only when progress is shown (it may shell out to
-      -- gpg --list-secret-keys on first use).
-      if M.config.show_progress then
-        notify_progress("Encrypting with key " .. encryption_key_label())
+      -- Show progress around encryption. The key label is built only when
+      -- progress is shown (it may shell out to gpg --list-secret-keys).
+      local progress
+      if M.config.show_progress ~= "none" then
+        progress = start_progress("Encrypting with key " .. encryption_key_label())
       end
 
       local encrypted = M.encrypt(content)
       if not encrypted then
+        finish_progress(progress)
         return -- Encryption failed, buffer stays 'modified' so no data is lost
       end
+
+      finish_progress(progress)
 
       if atomic_write(target, encrypted) then
         -- Clear 'modified' only when writing the buffer's own file (:w),
