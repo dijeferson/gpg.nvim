@@ -267,11 +267,11 @@ local function populate_decrypted(buf, file_path, content)
   vim.bo[buf].modified = false
   vim.b[buf].gpg_decrypt_failed = false
 
-  -- Trigger filetype detection on the underlying filename (strip .gpg)
+  -- Set the filetype from the underlying name so the decrypted content is
+  -- highlighted (e.g. notes.md.gpg -> markdown); fall back to "gpg".
   local inner_name = vim.fn.fnamemodify(file_path, ":t:r")
-  if inner_name ~= "" then
-    vim.filetype.match({ filename = inner_name, buf = buf })
-  end
+  local ft = inner_name ~= "" and vim.filetype.match({ filename = inner_name }) or nil
+  vim.bo[buf].filetype = ft or "gpg"
 end
 
 --- Decrypt a file into a buffer asynchronously so opening never blocks the
@@ -279,7 +279,12 @@ end
 --- @param buf integer Target buffer
 --- @param file_path string Path to the encrypted file
 local function decrypt_into_buffer_async(buf, file_path)
-  -- Prevent edits to the raw ciphertext while decryption is in flight.
+  -- Hide the raw ciphertext immediately: empty the buffer and lock it so
+  -- nothing is shown until decryption completes. Neovim has already read the
+  -- encrypted bytes into the buffer, but we clear them in this synchronous
+  -- pass (before any redraw), so the ciphertext never becomes visible.
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, {})
+  vim.bo[buf].modified = false
   vim.bo[buf].modifiable = false
 
   local progress = start_progress("Decrypting " .. vim.fn.fnamemodify(file_path, ":t"))
@@ -488,6 +493,21 @@ function M.setup(opts)
   if vim.fn.executable(M.config.gpg_binary_path) ~= 1 then
     vim.notify("gpg.nvim: " .. M.config.gpg_binary_path .. " not found in PATH", vim.log.levels.WARN)
     return
+  end
+
+  -- Teach Neovim the .gpg extension maps to the "gpg" filetype. (The
+  -- decrypted buffer is re-typed to the inner filetype, e.g. markdown, when
+  -- possible; "gpg" is the fallback for names like secret.gpg.)
+  vim.filetype.add({ extension = { gpg = "gpg" } })
+
+  -- Register a lock icon for .gpg files (best-effort; needs nvim-web-devicons).
+  -- The glyph is built from its codepoint (nf-fa-lock, U+F023) so the source
+  -- file stays plain ASCII.
+  local ok_icons, devicons = pcall(require, "nvim-web-devicons")
+  if ok_icons then
+    devicons.set_icon({
+      gpg = { icon = vim.fn.nr2char(0xf023), color = "#e0af68", name = "Gpg" },
+    })
   end
 
   setup_autocmds()
