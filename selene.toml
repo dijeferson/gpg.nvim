@@ -1,0 +1,4 @@
+std = "busted+vim"
+
+[lints]
+mixed_table = "allow"

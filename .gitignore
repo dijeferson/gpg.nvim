@@ -1,0 +1,10 @@
+# Vim/Neovim
+*.swp
+*.swo
+tags
+
+# Test artifacts
+*.gpgtmp.*
+
+# OS
+.DS_Store
